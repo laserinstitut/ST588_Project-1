@@ -1,26 +1,84 @@
 ---
 title: "Project 1"
+author: "Daria Smyslova"
 format: html
 editor: visual
 ---
 
-## Quarto
+### Part 1: Data Processing
 
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+#### Parsing Variable Values
 
 ```{r}
-1 + 1
-```
+library(httr)
+library(jsonlite)
 
-You can add options to executable code like this
+get_variable_values <- function(year) {
+  if (length(year) != 1 || !year %in% 2021:2024) {
+    stop("year must be 2021, 2022, 2023, or 2024")
+  }
+
+  url <- paste0(
+    "https://api.census.gov/data/",
+    year,
+    "/acs/acs1/pums/variables.json"
+  )
+
+  response <- GET(url)
+  stop_for_status(response)
+
+  json_text <- content(response, as = "text", encoding = "UTF-8")
+  variables <- fromJSON(json_text, simplifyVector = FALSE)$variables
+
+  state_variable <- if (year <= 2022) "ST" else "STATE"
+
+  keep <- c(
+    "AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP",
+    "PWGTP", "FER", "HHL", "SCH", "SCHL", "SEX",
+    state_variable, "REGION", "DIVISION"
+  )
+
+  missing_variables <- setdiff(keep, names(variables))
+  if (length(missing_variables) > 0) {
+    stop(
+      "Variables missing from the ", year, " JSON: ",
+      paste(missing_variables, collapse = ", ")
+    )
+  }
+
+  #Keep each requested variable's value definitions.
+  lapply(variables[keep], function(variable) variable$values)
+}
+```
 
 ```{r}
-#| echo: false
-2 * 2
+#Run it once per year and save the four lists together:
+values_2021 <- get_variable_values(2021)
+values_2022 <- get_variable_values(2022)
+values_2023 <- get_variable_values(2023)
+values_2024 <- get_variable_values(2024)
+
+all_variable_values <- list(
+  `2021` = values_2021,
+  `2022` = values_2022,
+  `2023` = values_2023,
+  `2024` = values_2024
+)
+
+dir.create("data", showWarnings = FALSE)
+saveRDS(all_variable_values, file = "data/variable_values.rds")
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+Before querying the Census data, I downloaded the PUMS variable descriptions for 2021 through 2024. I wrote a function that sends a `GET()` request to the appropriate year’s JSON file, parses the response, and keeps only the variables needed for this project. The function accounts for a naming change in the state variable: it is called `ST` in 2021 and 2022 and `STATE` in 2023 and 2024. I ran the function for each year and saved the four resulting lists together in `data/variable_values.rds` so the later functions can use the correct codes and labels for each year.
+
+```{r}
+names(values_2021)             
+names(values_2024)             
+values_2024$SEX$item           
+values_2024$AGEP$range         
+readRDS("data/variable_values.rds")$`2024`$SEX$item
+```
+
+I checked the saved lists before moving on. The 2021 list contains `ST`, the 2024 list contains `STATE`, and the 2024 `SEX` values map codes `1` and `2` to “Male” and “Female.” I also inspected the `AGEP` range and read the `.rds` file back into R to confirm that it saved correctly.
+
+#### Parsing API Data
