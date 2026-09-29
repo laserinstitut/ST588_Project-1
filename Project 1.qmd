@@ -82,3 +82,412 @@ readRDS("data/variable_values.rds")$`2024`$SEX$item
 I checked the saved lists before moving on. The 2021 list contains `ST`, the 2024 list contains `STATE`, and the 2024 `SEX` values map codes `1` and `2` to “Male” and “Female.” I also inspected the `AGEP` range and read the `.rds` file back into R to confirm that it saved correctly.
 
 #### Parsing API Data
+
+**1. Test one API request**
+
+```{r}
+library(httr)
+library(jsonlite)
+library(tibble)
+library(hms)
+
+api_key <- Sys.getenv("CENSUS_API_KEY")
+
+test_url <- "https://api.census.gov/data/2024/acs/acs1/pums"
+
+test_response <- GET(
+  test_url,
+  query = list(
+    get = "AGEP,PWGTP,SEX",
+    `for` = "state:37",  # North Carolina
+    key = api_key
+  )
+)
+
+stop_for_status(test_response)
+```
+
+**2. Write a helper that makes a tibble**
+
+The API returns an array: its first row contains column names, and the remaining rows contain observations.
+
+```{r}
+response_to_tibble <- function(response) {
+  stop_for_status(response)
+
+  api_data <- fromJSON(
+    content(response, as = "text", encoding = "UTF-8"),
+    simplifyMatrix = TRUE
+  )
+
+  if (!is.matrix(api_data) || nrow(api_data) < 2) {
+    stop("The API did not return any data rows.")
+  }
+
+  result <- as_tibble(
+    as.data.frame(api_data[-1, , drop = FALSE]),
+    .name_repair = "minimal"
+  )
+
+  names(result) <- api_data[1, ]
+  result
+}
+
+test_data <- response_to_tibble(test_response)
+glimpse(test_data)
+```
+
+After saving the variable values, I tested a query to the 2024 PUMS API for age (`AGEP`), person weight (`PWGTP`), and sex (`SEX`) in North Carolina. I then wrote `response_to_tibble()` to turn the API’s JSON response into a tibble. The first row of the response supplies the column names, and the remaining rows become observations. The test returned 114,270 rows with the three requested variables and a `state` column added by the API.
+
+At this point, the columns are still stored as character strings. The next step is to convert age and weight to numeric values and use the saved 2024 variable descriptions to label sex as a factor.
+
+**3. Helpers for labels and commute times**
+
+The time variables contain codes for intervals, so we look up each code’s description in the saved `.rds` file and calculate the interval’s midpoint.
+
+```{r}
+get_item_labels <- function(variable_values) {
+  items <- variable_values$item
+
+  if (is.null(items)) {
+    return(setNames(character(), character()))
+  }
+
+  unlist(items, use.names = TRUE)
+}
+
+#Return seconds
+time_label_to_seconds <- function(label) {
+  pattern <- paste0(
+    "(?i)^(\\d{1,2}):(\\d{2})\\s*([ap])\\.m\\.\\s+to\\s+",
+    "(\\d{1,2}):(\\d{2})\\s*([ap])\\.m\\."
+  )
+
+  parts <- regmatches(label, regexec(pattern, label, perl = TRUE))[[1]]
+
+  if (length(parts) != 7) {
+    return(NA_real_)
+  }
+
+  to_minutes <- function(hour, minute, am_pm) {
+    hour <- as.integer(hour) %% 12
+    if (tolower(am_pm) == "p") hour <- hour + 12
+
+    hour * 60 + as.integer(minute)
+  }
+
+  start <- to_minutes(parts[2], parts[3], parts[4])
+  end <- to_minutes(parts[5], parts[6], parts[7])
+
+  #An interval that crosses midnight.
+  if (end < start) end <- end + 24 * 60
+
+  midpoint_minutes <- ((start + end) / 2) %% (24 * 60)
+  midpoint_minutes * 60
+}
+
+parse_time_variable <- function(codes, variable_values) {
+  labels <- get_item_labels(variable_values)
+
+  midpoint_lookup <- vapply(
+    labels,
+    time_label_to_seconds,
+    numeric(1)
+  )
+
+  seconds <- unname(midpoint_lookup[as.character(codes)])
+  hms::as_hms(seconds)
+}
+
+parse_numeric_variable <- function(codes, variable_values) {
+  numbers <- suppressWarnings(as.numeric(codes))
+  labels <- get_item_labels(variable_values)
+
+  missing_codes <- names(labels)[
+    grepl("^N/A", labels, ignore.case = TRUE)
+  ]
+
+  numbers[as.character(codes) %in% missing_codes] <- NA_real_
+  numbers
+}
+
+parse_categorical_variable <- function(codes, variable_values) {
+  labels <- get_item_labels(variable_values)
+
+  if (length(labels) == 0) {
+    return(factor(codes))
+  }
+
+  #Put numbered codes in numerical order rather than JSON order.
+  label_order <- order(
+    suppressWarnings(as.numeric(names(labels))),
+    names(labels),
+    na.last = TRUE
+  )
+  labels <- labels[label_order]
+
+  factor(
+    as.character(codes),
+    levels = names(labels),
+    labels = unname(labels)
+  )
+}
+```
+
+```{r}
+#Check the midpoint helper
+time_label_to_seconds("7:05 a.m. to 7:09 a.m.") / 60
+```
+
+The PUMS commute-time variables use numeric codes for time intervals, rather than clock times directly. I wrote a helper to look up each code’s description in the year-specific values saved in the `.rds` file. Another helper reads the start and end of that interval and calculates its midpoint. Labels such as “N/A” become missing values.
+
+I tested the calculation with the interval 7:05 a.m. to 7:09 a.m. It returned 427 minutes after midnight, which is 7:07 a.m., the correct midpoint.
+
+**4. Write the single-year API function**
+
+```{r}
+get_census_data <- function(
+    year = 2024,
+    numeric_vars = c("AGEP", "PWGTP"),
+    categorical_vars = "SEX",
+    geography = "State",
+    geo_value = NULL,
+    dictionary_file = "data/variable_values.rds",
+    key = Sys.getenv("CENSUS_API_KEY")
+) {
+  allowed_years <- 2021:2024
+  allowed_numeric <- c(
+    "AGEP", "GASP", "GRPIP", "JWAP", "JWDP", "JWMNP"
+  )
+  allowed_categorical <- c("FER", "HHL", "SCH", "SCHL", "SEX")
+  time_vars <- c("JWAP", "JWDP")
+
+  # Validate the year.
+  if (length(year) != 1 || is.na(year) ||
+      !year %in% allowed_years) {
+    stop("year must be one of 2021, 2022, 2023, or 2024.")
+  }
+
+  #Validate numeric variables
+  if (!is.character(numeric_vars) ||
+      anyNA(numeric_vars) ||
+      anyDuplicated(numeric_vars) ||
+      !"PWGTP" %in% numeric_vars ||
+      !any(numeric_vars %in% allowed_numeric) ||
+      any(!numeric_vars %in% c(allowed_numeric, "PWGTP"))) {
+    stop(
+      "numeric_vars must include PWGTP and at least one ",
+      "allowed numeric variable."
+    )
+  }
+
+  #Validate categorical variables
+  if (!is.character(categorical_vars) ||
+      length(categorical_vars) == 0 ||
+      anyNA(categorical_vars) ||
+      anyDuplicated(categorical_vars) ||
+      any(!categorical_vars %in% allowed_categorical)) {
+    stop(
+      "categorical_vars must include at least one of: ",
+      paste(allowed_categorical, collapse = ", ")
+    )
+  }
+
+  #Only one geography level
+  if (length(geography) != 1 ||
+      is.na(geography) ||
+      !geography %in% c("Region", "Division", "State")) {
+    stop("geography must be exactly one of Region, Division, or State.")
+  }
+
+  if (!nzchar(key)) {
+    stop("Set CENSUS_API_KEY in .Renviron or provide key = ...")
+  }
+
+  # Load the values saved in the previous part.
+  all_values <- readRDS(dictionary_file)
+  year_values <- all_values[[as.character(year)]]
+
+  if (is.null(year_values)) {
+    stop("The .rds file does not contain values for this year.")
+  }
+
+  #State variable changed names after 2022
+  geography_variable <- switch(
+    geography,
+    Region = "REGION",
+    Division = "DIVISION",
+    State = if (year <= 2022) "ST" else "STATE"
+  )
+
+  api_geography <- tolower(geography)
+
+  #Defaults: North Carolina, South Atlantic division, South region.
+  if (is.null(geo_value)) {
+    geo_value <- switch(
+      geography,
+      State = "37",
+      Division = "5",
+      Region = "3"
+    )
+  }
+
+  if (length(geo_value) != 1 || is.na(geo_value)) {
+    stop("geo_value must be one code or 'all'.")
+  }
+
+  geo_value <- as.character(geo_value)
+
+  if (tolower(geo_value) == "all") {
+    geo_value <- "*"
+  } else {
+    allowed_codes <- names(
+      get_item_labels(year_values[[geography_variable]])
+    )
+
+    #Exclude Puerto Rico.
+    if (geography == "State") {
+      allowed_codes <- setdiff(allowed_codes, "72")
+    } else {
+      allowed_codes <- setdiff(allowed_codes, "0")
+    }
+
+    if (!geo_value %in% allowed_codes) {
+      stop(
+        "Invalid ", geography, " code. Check the codes in ",
+        dictionary_file, "."
+      )
+    }
+  }
+
+  requested_vars <- unique(c(numeric_vars, categorical_vars))
+
+  url <- paste0(
+    "https://api.census.gov/data/",
+    year,
+    "/acs/acs1/pums"
+  )
+
+  response <- GET(
+    url,
+    query = list(
+      get = paste(requested_vars, collapse = ","),
+      `for` = paste0(api_geography, ":", geo_value),
+      key = key
+    )
+  )
+
+  census_tibble <- response_to_tibble(response)
+
+  #Convert the weight and other numeric variables
+  census_tibble$PWGTP <- as.numeric(census_tibble$PWGTP)
+
+  for (variable in setdiff(numeric_vars, "PWGTP")) {
+    if (variable %in% time_vars) {
+      census_tibble[[variable]] <- parse_time_variable(
+        census_tibble[[variable]],
+        year_values[[variable]]
+      )
+    } else {
+      census_tibble[[variable]] <- parse_numeric_variable(
+        census_tibble[[variable]],
+        year_values[[variable]]
+      )
+    }
+  }
+
+  #Convert categorical codes to labeled factors
+  for (variable in categorical_vars) {
+    census_tibble[[variable]] <- parse_categorical_variable(
+      census_tibble[[variable]],
+      year_values[[variable]]
+    )
+  }
+
+  #API adds a lowercase geography-code column
+  #Add a readable factor while retaining that code column
+  census_tibble$geography_label <- parse_categorical_variable(
+    census_tibble[[api_geography]],
+    year_values[[geography_variable]]
+  )
+
+  class(census_tibble) <- c("census", class(census_tibble))
+  census_tibble
+}
+```
+
+I combined the earlier helpers into `get_census_data()`, which queries one year of PUMS data and returns a formatted tibble. The function defaults to 2024, age and person weight as numeric variables, sex as a categorical variable, and North Carolina as the state. The user can choose other permitted variables and request one state, division, or region, including all values within that geography level.
+
+Before sending the request, the function checks that the year, variables, and geography are valid. It requires `PWGTP`, at least one other numeric variable, and at least one categorical variable. After receiving the data, it converts measurements to numeric values, commute-time codes to interval midpoints, and categorical codes to labeled factors using the selected year’s saved variable values. Finally, it adds a readable geography label and the `census` class so the data can be used with the custom summary and plotting functions later in the project.
+
+**5. Testing the single-year API function**
+
+```{r}
+#Default: 2024, North Carolina, AGEP, PWGTP, and SEX
+nc_2024 <- get_census_data()
+dplyr::slice_head(nc_2024, n = 3)
+```
+
+```{r}
+#Different year, numeric variable, and categorical variables
+dc_2023 <- get_census_data(
+  year = 2023,
+  numeric_vars = c("JWDP", "PWGTP"),
+  categorical_vars = c("SEX", "SCH"),
+  geography = "State",
+  geo_value = "11"
+)
+
+dplyr::glimpse(dc_2023)
+```
+
+I tested `get_census_data()` first with its default settings. It returned 2024 North Carolina records with age and person weight stored as numeric values, sex as a labeled factor, and a readable state label. Displaying the first three rows confirmed that the API response was converted into the expected tibble structure.
+
+I then changed the inputs to request 2023 data for Washington, DC, including departure time (`JWDP`) and school enrollment (`SCH`). The function returned 6,735 rows. Departure times appeared as clock times calculated from the midpoints of their coded intervals, while unavailable times appeared as `NA`. The categorical variables were labeled factors. Together, these examples show that the function works with both its defaults and user-selected options.
+
+**Combining Years**
+
+```{r}
+get_census_years <- function(years = 2021:2024, ...) {
+  if (!is.numeric(years) ||
+      length(years) < 2 ||
+      anyNA(years) ||
+      anyDuplicated(years) ||
+      any(!years %in% 2021:2024)) {
+    stop("Provide at least two distinct years from 2021 through 2024.")
+  }
+
+  year_data <- lapply(years, function(current_year) {
+    one_year <- get_census_data(
+      year = current_year,
+      ...
+    )
+
+    one_year$year <- factor(
+      as.character(current_year),
+      levels = as.character(years)
+    )
+
+    one_year
+  })
+
+  combined <- dplyr::bind_rows(year_data)
+  class(combined) <- c("census", setdiff(class(combined), "census"))
+
+  combined
+}
+```
+
+```{r}
+nc_two_years <- get_census_years(
+  years = c(2023, 2024),
+  geography = "State",
+  geo_value = "37"
+)
+
+table(nc_two_years$year)
+```
+
+I wrote `get_census_years()` to retrieve data for multiple survey years using the single-year function. It checks that the requested years are distinct and within 2021–2024, calls `get_census_data()` once for each year, adds a `year` column, and combines the results into one tibble. The other variable and geography options are passed to each call, and the combined tibble retains the `census` class.
+
+I tested the function with North Carolina data from 2023 and 2024. The resulting year table showed 111,920 records from 2023 and 114,270 from 2024, for 226,190 records total. This confirms that records from both years are present and identified by the `year` column.
