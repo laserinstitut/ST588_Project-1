@@ -493,3 +493,152 @@ I wrote `get_census_years()` to retrieve data for multiple survey years using th
 I tested the function with North Carolina data from 2023 and 2024. The resulting year table showed 111,920 records from 2023 and 114,270 from 2024, for 226,190 records total. This confirms that records from both years are present and identified by the `year` column.
 
 ### Part 2: Writing a Generic Function for Summarizing
+
+```{r}
+class(nc_2024)
+class(dc_2023)
+class(nc_two_years)
+```
+
+To test the generic summary and plotting methods, I use three census objects created in Part 1: `nc_2024`, containing North Carolina data for 2024; `dc_2023`, containing District of Columbia data for 2023; and `nc_two_years`, containing North Carolina data for 2023 and 2024. Each object includes `"census"` as its first class, allowing R to dispatch calls to the custom `summary.census()` and `plot.census()` methods.
+
+```{r}
+plot.function
+getS3method("plot", "data.frame")
+plot
+```
+
+The output shows that `plot()` is a generic function that uses `UseMethod("plot")` to choose a plotting method based on the object’s class. For example, R uses `plot.function()` for a function and `plot.data.frame()` for a data frame. The methods contain different code because functions and data frames need to be plotted differently. In the same way, since our data have the `"census"` class, we can create `summary.census()` and `plot.census()` methods that are designed specifically for the census data and account for the `PWGTP` weights.
+
+#### Numeric summaries
+
+```{r}
+summary.census <- function(object,
+                           numeric_vars = NULL,
+                           categorical_vars = NULL) {
+  
+  if (!"PWGTP" %in% names(object)) {
+    stop("The census tibble must contain PWGTP.")
+  }
+  
+  time_vars <- c("JWAP", "JWDP", "JWMNP")
+  
+  #Select all numeric variables except PWGTP, year, and the time variables
+  if (is.null(numeric_vars)) {
+    numeric_vars <- names(object)[
+      vapply(object, is.numeric, logical(1))
+    ]
+    
+    numeric_vars <- setdiff(
+      numeric_vars,
+      c("PWGTP", "year", time_vars)
+    )
+  }
+  
+  #Select all factor variables
+  if (is.null(categorical_vars)) {
+    categorical_vars <- names(object)[
+      vapply(object, is.factor, logical(1))
+    ]
+    
+    #Treat year as categorical
+    if ("year" %in% names(object)) {
+      categorical_vars <- union(categorical_vars, "year")
+    }
+  }
+  
+  #Check the requested variables exist
+  missing_numeric <- setdiff(numeric_vars, names(object))
+  missing_categorical <- setdiff(categorical_vars, names(object))
+  
+  if (length(missing_numeric) > 0) {
+    stop(
+      "Numeric variable(s) not found: ",
+      paste(missing_numeric, collapse = ", ")
+    )
+  }
+  
+  if (length(missing_categorical) > 0) {
+    stop(
+      "Categorical variable(s) not found: ",
+      paste(missing_categorical, collapse = ", ")
+    )
+  }
+  
+  weights <- object$PWGTP
+  
+  #Calculate weighted means and standard deviations
+  numeric_summary <- lapply(numeric_vars, function(variable) {
+    
+    values <- object[[variable]]
+    complete <- !is.na(values) & !is.na(weights)
+    
+    values_complete <- values[complete]
+    weights_complete <- weights[complete]
+    
+    sample_mean <- sum(
+      values_complete * weights_complete
+    ) / sum(weights_complete)
+    
+    sample_sd <- sqrt(
+      sum(
+        values_complete^2 * weights_complete
+      ) / sum(weights_complete) -
+        sample_mean^2
+    )
+    
+    list(
+      mean = sample_mean,
+      standard_deviation = sample_sd
+    )
+  })
+  
+  names(numeric_summary) <- numeric_vars
+  
+  # Calculate weighted counts for categorical variables
+  categorical_summary <- lapply(categorical_vars, function(variable) {
+    
+    values <- object[[variable]]
+    complete <- !is.na(values) & !is.na(weights)
+    
+    values_complete <- factor(values[complete])
+    weights_complete <- weights[complete]
+    
+    counts <- tapply(
+      weights_complete,
+      values_complete,
+      sum
+    )
+    
+    return(counts)
+  })
+  
+  names(categorical_summary) <- categorical_vars
+  
+  #Return the summaries as a named list
+  list(
+    numeric_summaries = numeric_summary,
+    categorical_counts = categorical_summary
+  )
+}
+
+```
+
+```{r}
+summary(nc_2024)
+summary(dc_2023)
+summary(nc_two_years)
+```
+
+The function produced weighted summaries for all three census objects. For the numeric variables, it calculated weighted means and standard deviations, and for the categorical variables, it calculated estimated population counts. For example, the estimated population of North Carolina in 2024 was 11,046,024, while the estimated population of the District of Columbia in 2023 was 678,972. The combined North Carolina object also shows separate population estimates for 2023 and 2024. These results are population estimates rather than row counts because the function uses `PWGTP` as the weight. The empty numeric summary for `dc_2023` is expected because that object does not include a numeric variable to summarize other than the weight variable.
+
+```{r}
+#User-selected variables
+summary(
+  nc_two_years,
+  numeric_vars = "AGEP",
+  categorical_vars = c("SEX", "year")
+)
+```
+
+For the combined North Carolina data, the weighted mean age was approximately 39.77 years, with a weighted standard deviation of 23.26 years. The estimated population included 10,697,940 males and 11,183,575 females. The estimated population was 10,835,491 in 2023 and 11,046,024 in 2024. These values are weighted population estimates based on `PWGTP`, not the number of rows in the dataset. This example also demonstrates that the user can choose which numeric and categorical variables the function summarizes.
