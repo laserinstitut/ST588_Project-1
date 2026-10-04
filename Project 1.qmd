@@ -491,3 +491,5 @@ table(nc_two_years$year)
 I wrote `get_census_years()` to retrieve data for multiple survey years using the single-year function. It checks that the requested years are distinct and within 2021–2024, calls `get_census_data()` once for each year, adds a `year` column, and combines the results into one tibble. The other variable and geography options are passed to each call, and the combined tibble retains the `census` class.
 
 I tested the function with North Carolina data from 2023 and 2024. The resulting year table showed 111,920 records from 2023 and 114,270 from 2024, for 226,190 records total. This confirms that records from both years are present and identified by the `year` column.
+
+### Part 2: Writing a Generic Function for Summarizing
