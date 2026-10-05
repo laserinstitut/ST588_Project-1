@@ -12,6 +12,7 @@ editor: visual
 ```{r}
 library(httr)
 library(jsonlite)
+library(dplyr)
 
 get_variable_values <- function(year) {
   if (length(year) != 1 || !year %in% 2021:2024) {
@@ -642,3 +643,146 @@ summary(
 ```
 
 For the combined North Carolina data, the weighted mean age was approximately 39.77 years, with a weighted standard deviation of 23.26 years. The estimated population included 10,697,940 males and 11,183,575 females. The estimated population was 10,835,491 in 2023 and 11,046,024 in 2024. These values are weighted population estimates based on `PWGTP`, not the number of rows in the dataset. This example also demonstrates that the user can choose which numeric and categorical variables the function summarizes.
+
+#### Graphical summaries
+
+```{r}
+library(ggplot2)
+
+plot.census <- function(x, cat_var, num_var, ...) {
+  
+  #Both variables need to be specified
+  if (missing(cat_var) || missing(num_var)) {
+    stop("Specify one categorical variable and one numeric variable.")
+  }
+  
+  #Check the variables exist
+  if (!cat_var %in% names(x)) {
+    stop(paste(cat_var, "was not found in the census tibble."))
+  }
+  
+  if (!num_var %in% names(x)) {
+    stop(paste(num_var, "was not found in the census tibble."))
+  }
+  
+  #Check PWGTP is available
+  if (!"PWGTP" %in% names(x)) {
+    stop("The census tibble must contain PWGTP.")
+  }
+  
+  #Check that the numeric variable is numeric
+  if (!is.numeric(x[[num_var]])) {
+    stop(paste(num_var, "must be numeric."))
+  }
+  ggplot(
+    x,
+    aes(
+      x = factor(get(cat_var)),
+      y = get(num_var),
+      weight = PWGTP
+    )
+  ) +
+    geom_boxplot(...) +
+    labs(
+      title = paste(num_var, "by", cat_var),
+      x = cat_var,
+      y = num_var
+    ) +
+    theme_minimal()
+}
+```
+
+To create the graphical summary, I wrote a `plot.census()` method for objects with the `"census"` class. The function requires the user to provide one categorical variable and one numeric variable. It first checks that both variables exist in the data and that the selected numeric variable is actually numeric. It then creates a boxplot showing the distribution of the numeric variable for each level of the categorical variable. I included `PWGTP` as the weight so that each row contributes according to the number of people it represents. Since this is a method for the `"census"` class, R automatically uses it when `plot()` is called on a census object.
+
+```{r}
+#Age distribution by sex
+plot(
+  nc_2024,
+  cat_var = "SEX",
+  num_var = "AGEP"
+)
+```
+
+The weighted age distributions for males and females in North Carolina are similar. The median age is approximately 38 years for males and 40 years for females, indicating that females have a slightly higher median age. Both groups have a wide age range, extending from approximately 0 to 90 years. The boxplot incorporates `PWGTP`, so the distributions reflect estimated population weights rather than treating every row equally.
+
+```{r}
+#Age distribution by year
+plot(
+  nc_two_years,
+  cat_var = "year",
+  num_var = "AGEP"
+)
+```
+
+The age distributions in North Carolina were very similar in 2023 and 2024. In both years, the median age was about 39 years, and most ages fell between approximately 20 and 59 years. This shows that the age distribution did not change much between the two years. The graph uses `PWGTP` to account for the number of people represented by each row.
+
+#### Investigation: Age Differences in DC and North Carolina
+
+For this investigation, I examined whether the age distribution in the District of Columbia differed by sex and whether it changed between 2023 and 2024. I also compared the 2024 age distribution in DC with the age distribution in North Carolina. I used my API functions to collect the data and then applied the custom `summary.census()` and `plot.census()` methods to summarize and visualize the results.
+
+```{r}
+#DC data for 2024
+dc_2024 <- get_census_data(
+  year = 2024,
+  numeric_vars = c("AGEP", "PWGTP"),
+  categorical_vars = "SEX",
+  geography = "State",
+  geo_value = "11"
+)
+
+#DC data for two years
+dc_two_years <- get_census_years(
+  years = c(2023, 2024),
+  numeric_vars = c("AGEP", "PWGTP"),
+  categorical_vars = "SEX",
+  geography = "State",
+  geo_value = "11"
+)
+```
+
+**Summaries**
+
+```{r}
+# Use the default summary settings
+summary(dc_2024)
+
+# Select specific variables to summarize
+summary(
+  dc_two_years,
+  numeric_vars = "AGEP",
+  categorical_vars = c("SEX", "year")
+)
+```
+
+In 2024, the weighted mean age was approximately 37.02 years in the District of Columbia and 39.81 years in North Carolina. Therefore, the average person represented in the DC data was about 2.79 years younger. DC also had a smaller weighted standard deviation in age, 21.36 years compared with 23.28 years in North Carolina, suggesting slightly less variation in age.
+
+The estimated population of DC increased from 678,972 in 2023 to 702,250 in 2024, an increase of 23,278 people, or approximately 3.43%. North Carolina’s estimated population increased from 10,835,491 to 11,046,024, an increase of 210,533 people, or approximately 1.94%. Although North Carolina added more people overall, DC had the larger percentage increase.
+
+Females also represented a slightly larger share of the estimated population in both locations. In 2024, females made up approximately 52.66% of DC’s population and 51.19% of North Carolina’s population. Overall, the results suggest that DC had a younger population and grew at a faster percentage rate, while the age distributions within both locations remained fairly stable between 2023 and 2024. All estimates use `PWGTP`.
+
+```{r}
+plot(
+  dc_two_years,
+  cat_var = "year",
+  num_var = "AGEP"
+)
+```
+
+```{r}
+#Combine the 2024 NC DC data for comparison
+nc_dc_2024 <- bind_rows(nc_2024, dc_2024)
+
+#Make sure the combined object has the census class
+class(nc_dc_2024) <- c(
+  "census",
+  setdiff(class(nc_dc_2024), "census")
+)
+
+plot(
+  nc_dc_2024,
+  cat_var = "geography_label",
+  num_var = "AGEP"
+)
+```
+
+The plot shows that the age distribution in North Carolina was generally higher than in the District of Columbia in 2024. The median age was around 34 years in DC and around 39 years in North Carolina. North Carolina also had a slightly wider middle range of ages. This supports the numerical summaries, which showed a weighted mean age of 37.02 years in DC and 39.81 years in North Carolina. Therefore, the 2024 population of North Carolina appears to have been somewhat older than the population of DC.
